@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">
+  <path d="M12 2 L21 7 L21 17 L12 22 L3 17 L3 7 Z" />
+  <path d="M12 2 L12 8.5 M3 7 L12 8.5 L21 7 M12 8.5 L6 15.5 L12 22 M12 8.5 L18 15.5 L12 22 M3 17 L6 15.5 M21 17 L18 15.5 M6 15.5 L18 15.5" opacity="0.7"/>
+  <text x="12" y="14.8" font-size="5.5" font-family="Arial, sans-serif" text-anchor="middle" fill="currentColor" stroke="none" font-weight="bold">20</text>
+</svg>
