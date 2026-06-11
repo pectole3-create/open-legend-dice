@@ -13,7 +13,7 @@
 // pruned on every read/write, and the KV value carries a 2-day TTL as a janitor
 // backstop, so rolls are kept for a day and then disappear automatically.
 
-const VERSION = "1.3.0";
+const VERSION = "1.3.1";
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MAX_HISTORY = 100;
 const KV_TTL_SECONDS = 2 * 24 * 60 * 60; // backstop; precise 24h pruning is by timestamp

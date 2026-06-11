@@ -14,7 +14,7 @@
 //  - A slow reconcile poll (every 20s) pulls the canonical server log so late
 //    joiners, missed broadcasts, and clears all converge.
 
-const VERSION = "1.3.0";
+const VERSION = "1.3.1";
 const ROOMID_KEY = "com.vladi.open-legend-dice/roomId";
 const CHANNEL = "com.vladi.open-legend-dice/roll";
 const AUDIT_KEY = "open-legend-dice-audit";
@@ -117,7 +117,14 @@ async function reconcile() {
 async function initOBR() {
   setStatus("connecting…");
   try {
-    const mod = await import("https://cdn.jsdelivr.net/npm/@owlbear-rodeo/sdk@3/+esm");
+    // The SDK is bundled and served from this same origin (public/owlbear-sdk.js),
+    // so it loads for anyone who can open the extension — no third-party CDN that
+    // an ad-blocker or proxy might block. The timeout guards against a stuck load
+    // so the panel can never sit on "connecting…" forever.
+    const mod = await Promise.race([
+      import("./owlbear-sdk.js"),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("SDK load timed out")), 8000)),
+    ]);
     const sdk = mod.default;
     if (sdk.isAvailable) {
       OBR = sdk;

@@ -1,13 +1,18 @@
 {
   "name": "open-legend-dice",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "private": true,
   "description": "Owlbear Rodeo dice roller for Open Legend RPG with a shared server-side log.",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "build:sdk": "esbuild src/sdk-entry.js --bundle --format=esm --target=es2020 --minify --outfile=public/owlbear-sdk.js",
+    "dev": "npm run build:sdk && wrangler dev",
+    "deploy": "npm run build:sdk && wrangler deploy"
   },
   "devDependencies": {
     "wrangler": "^4"
+  },
+  "dependencies": {
+    "@owlbear-rodeo/sdk": "^3.1.0",
+    "esbuild": "^0.28.0"
   }
 }
