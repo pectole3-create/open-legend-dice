@@ -4,8 +4,12 @@
 //  - Advantage X: roll X extra attribute dice, keep the normal amount (drop the X lowest).
 //  - Disadvantage X: same, but drop the X highest.
 //  - The d20 itself only gains adv/dis when there are no attribute dice in the pool.
+//
+// The roll log lives in room metadata, so every player sees the same shared log
+// (including rolls made while their panel was closed). Anyone can remove their
+// own rolls from it with "Clear my rolls".
 
-const CHANNEL = "com.vladi.open-legend-dice/roll";
+const LOG_KEY = "com.vladi.open-legend-dice/log";
 const DIE_SIZES = [4, 6, 8, 10, 12, 20];
 const MAX_DICE_PER_TYPE = 20;
 const MAX_EXPLOSIONS = 50;
@@ -30,6 +34,9 @@ const pool = new Map(); // die size -> count
 let advantage = 0; // positive = advantage, negative = disadvantage
 let playerName = "You";
 let OBR = null;
+let obrReady = false;
+let localLog = []; // fallback log when running outside Owlbear Rodeo
+let lastSeenTime = Date.now(); // for notifying about other players' new rolls
 
 const $ = (id) => document.getElementById(id);
 const attrGrid = $("attrGrid");
@@ -49,12 +56,14 @@ async function initOBR() {
     if (!sdk.isAvailable) return; // running outside Owlbear Rodeo: stay local-only
     OBR = sdk;
     OBR.onReady(async () => {
+      obrReady = true;
       playerName = (await OBR.player.getName()) || "Player";
-      OBR.broadcast.onMessage(CHANNEL, (event) => {
-        if (event.data && Array.isArray(event.data.dice)) {
-          addHistoryEntry(event.data);
-          notify(event.data);
-        }
+      const metadata = await OBR.room.getMetadata();
+      renderLog(getLog(metadata));
+      OBR.room.onMetadataChange((md) => {
+        const log = getLog(md);
+        renderLog(log);
+        notifyNewRemoteRolls(log);
       });
     });
   } catch (err) {
@@ -62,11 +71,48 @@ async function initOBR() {
   }
 }
 
+function getLog(metadata) {
+  const log = metadata[LOG_KEY];
+  return Array.isArray(log) ? log : [];
+}
+
+async function appendToLog(entry) {
+  if (obrReady) {
+    const metadata = await OBR.room.getMetadata();
+    const log = getLog(metadata);
+    log.push(entry);
+    while (log.length > MAX_HISTORY) log.shift();
+    await OBR.room.setMetadata({ [LOG_KEY]: log });
+  } else {
+    localLog.push(entry);
+    if (localLog.length > MAX_HISTORY) localLog = localLog.slice(-MAX_HISTORY);
+    renderLog(localLog);
+  }
+}
+
+async function clearMyRolls() {
+  if (obrReady) {
+    const metadata = await OBR.room.getMetadata();
+    const log = getLog(metadata).filter((e) => e.name !== playerName);
+    await OBR.room.setMetadata({ [LOG_KEY]: log });
+  } else {
+    localLog = [];
+    renderLog(localLog);
+  }
+}
+
 function notify(entry) {
-  if (!OBR) return;
+  if (!obrReady) return;
   OBR.notification
     .show(`${entry.name} rolled ${entry.formula}: ${entry.total}`, "INFO")
     .catch(() => {});
+}
+
+function notifyNewRemoteRolls(log) {
+  for (const entry of log) {
+    if (entry.time > lastSeenTime && entry.name !== playerName) notify(entry);
+    if (entry.time > lastSeenTime) lastSeenTime = entry.time;
+  }
 }
 
 // ---------- dice logic ----------
@@ -95,7 +141,7 @@ function formulaString() {
   return parts.join(" + ");
 }
 
-function doRoll() {
+async function doRoll() {
   if (pool.size === 0) return;
   const exploding = explodeToggle.checked;
   const dice = [];
@@ -133,11 +179,9 @@ function doRoll() {
     time: Date.now(),
   };
 
-  addHistoryEntry(entry);
-  if (OBR) {
-    OBR.broadcast.sendMessage(CHANNEL, entry).catch(() => {});
-    notify(entry);
-  }
+  lastSeenTime = entry.time;
+  notify(entry);
+  await appendToLog(entry); // metadata change re-renders the log for everyone, including us
 }
 
 // ---------- UI ----------
@@ -194,7 +238,7 @@ function escapeHtml(s) {
   })[c]);
 }
 
-function addHistoryEntry(entry) {
+function buildEntryElement(entry) {
   const div = document.createElement("div");
   div.className = "entry";
 
@@ -224,9 +268,14 @@ function addHistoryEntry(entry) {
     </div>
     <div class="entry-formula">${escapeHtml(entry.formula)}${advTag}${explodeTag}</div>
     <div class="die-results">${diceHtml}</div>`;
+  return div;
+}
 
-  historyEl.prepend(div);
-  while (historyEl.children.length > MAX_HISTORY) historyEl.lastChild.remove();
+function renderLog(log) {
+  historyEl.innerHTML = "";
+  for (let i = log.length - 1; i >= 0; i--) {
+    historyEl.appendChild(buildEntryElement(log[i]));
+  }
 }
 
 function buildControls() {
@@ -252,6 +301,7 @@ function buildControls() {
   $("advPlus").addEventListener("click", () => { advantage = Math.min(advantage + 1, 9); renderAdvLabel(); });
   $("advMinus").addEventListener("click", () => { advantage = Math.max(advantage - 1, -9); renderAdvLabel(); });
   $("clearBtn").addEventListener("click", () => { pool.clear(); renderPool(); });
+  $("clearLogBtn").addEventListener("click", clearMyRolls);
   rollBtn.addEventListener("click", doRoll);
 }
 

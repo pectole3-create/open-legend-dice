@@ -17,6 +17,7 @@
       --green: #6fe3a5;
       --red: #ff7b7b;
       --gold: #ffd166;
+      --orange: #ff9b3d;
     }
     * { box-sizing: border-box; }
     html, body {
@@ -187,7 +188,7 @@
       margin-bottom: 4px;
     }
     .entry-name { font-weight: 600; font-size: 12.5px; }
-    .entry-total { font-size: 18px; font-weight: 800; color: var(--accent); }
+    .entry-total { font-size: 18px; font-weight: 800; color: var(--orange); }
     .entry-formula { font-size: 11.5px; color: var(--text-dim); margin-bottom: 4px; }
     .entry-formula .adv { color: var(--green); }
     .entry-formula .dis { color: var(--red); }
@@ -204,6 +205,20 @@
     .die.exploded .sum { color: var(--gold); font-weight: 700; }
     .die.dropped { opacity: 0.45; text-decoration: line-through; }
     .die .extra-mark { color: var(--accent); font-size: 10px; margin-left: 3px; }
+    .log-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    #clearLogBtn {
+      background: none;
+      border: none;
+      color: var(--text-dim);
+      font-size: 11px;
+      cursor: pointer;
+      padding: 2px 4px;
+    }
+    #clearLogBtn:hover { color: var(--red); text-decoration: underline; }
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
   </style>
@@ -247,7 +262,10 @@
       <button id="clearBtn" title="Clear dice pool">Clear</button>
     </div>
 
-    <div class="section-label">Roll log</div>
+    <div class="log-head">
+      <div class="section-label" style="margin-bottom:0">Roll log (shared)</div>
+      <button id="clearLogBtn" title="Remove your own rolls from the shared log">Clear my rolls</button>
+    </div>
     <div id="history"></div>
   </div>
 

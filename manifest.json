@@ -1,8 +1,8 @@
 {
   "name": "Open Legend Dice",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "manifest_version": 1,
-  "author": "Vladi",
+  "author": "VladiSlave",
   "description": "Dice roller for Open Legend RPG: mixed dice pools, exploding dice, advantage and disadvantage.",
   "icon": "https://pectole3-create.github.io/open-legend-dice/icon.svg",
   "action": {
