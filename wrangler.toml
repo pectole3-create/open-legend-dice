@@ -13,4 +13,4 @@ binding = "ASSETS"
 #   npx wrangler kv namespace create LOG
 [[kv_namespaces]]
 binding = "LOG"
-id = "11111111111111111111111111111111"
+id = "82ad6dc0ce4440e6b7bbc536a2efdb79"
