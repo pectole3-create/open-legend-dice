@@ -1,0 +1,13 @@
+{
+  "name": "open-legend-dice",
+  "version": "1.3.0",
+  "private": true,
+  "description": "Owlbear Rodeo dice roller for Open Legend RPG with a shared server-side log.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}

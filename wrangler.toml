@@ -1,0 +1,16 @@
+name = "open-legend-dice"
+main = "src/worker.js"
+compatibility_date = "2026-06-01"
+
+# Static files (index.html, main.js, icon.svg) live in ./public. There is no
+# static manifest.json, so /manifest.json falls through to the Worker, which
+# generates it dynamically from the request origin.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+# Shared roll log. Replace `id` with the value printed by:
+#   npx wrangler kv namespace create LOG
+[[kv_namespaces]]
+binding = "LOG"
+id = "11111111111111111111111111111111"

@@ -3,25 +3,27 @@
 //  - Every die explodes: rolling the max value rolls that die again and adds (can chain).
 //  - Advantage X: roll X extra attribute dice, keep the normal amount (drop the X lowest).
 //  - Disadvantage X: same, but drop the X highest.
-//  - With no attribute dice (bare d20), adv/dis adds at most ONE extra d20
-//    (you never roll more than 2d20), keeping the highest/lowest.
+//  - With no attribute dice (bare d20), adv/dis adds at most ONE extra d20.
 //
-// Shared log: rolls are written to room metadata (Owlbear's shared room state,
-// persisted with the room) AND broadcast to connected players. Receivers merge
-// both sources by roll id, so a failure in one channel doesn't lose the roll.
-// Each client also keeps a 24-hour audit log in localStorage of every roll it
-// observed (even ones cleared from the shared log), exportable as a file.
+// Sync model:
+//  - Durable shared log lives on the server (Cloudflare Worker + KV), keyed per
+//    Owlbear room, auto-pruned to the last 24h. This is the source of truth and
+//    the audit trail you can verify later.
+//  - Owlbear broadcast pushes each roll to connected players instantly, so the
+//    log feels live without waiting on a server round-trip.
+//  - A slow reconcile poll (every 20s) pulls the canonical server log so late
+//    joiners, missed broadcasts, and clears all converge.
 
-const VERSION = "1.2.1";
-const LOG_KEY = "com.vladi.open-legend-dice/log";
+const VERSION = "1.3.0";
+const ROOMID_KEY = "com.vladi.open-legend-dice/roomId";
 const CHANNEL = "com.vladi.open-legend-dice/roll";
 const AUDIT_KEY = "open-legend-dice-audit";
-const AUDIT_TTL_MS = 24 * 60 * 60 * 1000; // keep audit entries for one day
+const AUDIT_TTL_MS = 24 * 60 * 60 * 1000;
+const RECONCILE_MS = 20000;
 const DIE_SIZES = [4, 6, 8, 10, 12, 20];
 const MAX_DICE_PER_TYPE = 20;
 const MAX_EXPLOSIONS = 50;
 const MAX_HISTORY = 100;
-const MAX_LOG_BYTES = 12000; // room metadata is capped at 16KB total
 
 // Attribute score -> attribute dice (always paired with 1d20), per Open Legend.
 const ATTRIBUTE_DICE = {
@@ -43,8 +45,10 @@ let advantage = 0; // positive = advantage, negative = disadvantage
 let playerName = "You";
 let OBR = null;
 let obrReady = false;
-let currentLog = []; // entries currently shown, merged from metadata + broadcasts
-let lastSeenTime = Date.now(); // for notifying about other players' new rolls
+let roomId = "standalone"; // server log key; replaced with a per-room id under Owlbear
+let serverOk = false;
+let currentLog = [];
+let lastSeenTime = Date.now();
 
 const $ = (id) => document.getElementById(id);
 const attrGrid = $("attrGrid");
@@ -65,6 +69,49 @@ function setStatus(text, isError = false) {
   statusEl.classList.toggle("error", isError);
 }
 
+// ---------- server API (Cloudflare Worker) ----------
+
+async function api(path, options) {
+  const res = await fetch(path, options);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+async function serverGetLog() {
+  const data = await api(`/api/log?room=${encodeURIComponent(roomId)}`);
+  return Array.isArray(data.entries) ? data.entries : [];
+}
+
+async function serverPostRoll(entry) {
+  const data = await api("/api/roll", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ room: roomId, entry }),
+  });
+  return Array.isArray(data.entries) ? data.entries : [];
+}
+
+async function serverClear(name) {
+  const data = await api("/api/clear", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ room: roomId, name }),
+  });
+  return Array.isArray(data.entries) ? data.entries : [];
+}
+
+async function reconcile() {
+  try {
+    const entries = await serverGetLog();
+    serverOk = true;
+    setLogFromServer(entries);
+    setStatus(obrReady ? `connected as ${playerName} — shared log live` : "standalone — shared log live");
+  } catch (err) {
+    serverOk = false;
+    setStatus(`server log unreachable (${err.message}) — showing local only`, true);
+  }
+}
+
 // ---------- Owlbear Rodeo SDK ----------
 
 async function initOBR() {
@@ -72,41 +119,66 @@ async function initOBR() {
   try {
     const mod = await import("https://cdn.jsdelivr.net/npm/@owlbear-rodeo/sdk@3/+esm");
     const sdk = mod.default;
-    if (!sdk.isAvailable) {
-      setStatus("standalone (not inside Owlbear) — log is local only");
-      return;
+    if (sdk.isAvailable) {
+      OBR = sdk;
+      OBR.onReady(async () => {
+        try {
+          obrReady = true;
+          playerName = (await OBR.player.getName()) || "Player";
+          roomId = await ensureRoomId();
+          OBR.broadcast.onMessage(CHANNEL, (event) => {
+            if (event.data && Array.isArray(event.data.dice)) mergeEntries([event.data], true);
+          });
+        } catch (err) {
+          setStatus(`Owlbear error: ${err.message || err}`, true);
+        }
+        await reconcile();
+      });
+    } else {
+      // Opened directly in a browser tab (not inside Owlbear) — still uses the
+      // shared server log under a fixed "standalone" room for testing.
+      await reconcile();
     }
-    OBR = sdk;
-    OBR.onReady(async () => {
-      try {
-        obrReady = true;
-        playerName = (await OBR.player.getName()) || "Player";
-        const metadata = await OBR.room.getMetadata();
-        mergeEntries(getLog(metadata));
-        OBR.room.onMetadataChange((md) => mergeEntries(getLog(md), true));
-        OBR.broadcast.onMessage(CHANNEL, (event) => {
-          if (event.data && Array.isArray(event.data.dice)) {
-            mergeEntries([event.data], true);
-          }
-        });
-        setStatus(`connected as ${playerName} — shared log active`);
-      } catch (err) {
-        setStatus(`connection error: ${err.message || err}`, true);
-      }
-    });
   } catch (err) {
-    console.warn("Owlbear Rodeo SDK unavailable, running standalone:", err);
-    setStatus("standalone (SDK failed to load) — log is local only", true);
+    console.warn("Owlbear SDK unavailable:", err);
+    await reconcile();
   }
+  setInterval(reconcile, RECONCILE_MS);
 }
 
-function getLog(metadata) {
-  const log = metadata[LOG_KEY];
-  return Array.isArray(log) ? log : [];
+// A stable per-room id: the first client to load mints a uuid into the room's
+// Owlbear metadata; everyone else reads it. Keeps each game's log separate.
+async function ensureRoomId() {
+  const md = await OBR.room.getMetadata();
+  let rid = md[ROOMID_KEY];
+  if (typeof rid !== "string" || !rid) {
+    rid = (crypto.randomUUID && crypto.randomUUID()) || `r${Date.now()}${Math.random().toString(36).slice(2)}`;
+    await OBR.room.setMetadata({ [ROOMID_KEY]: rid });
+  }
+  return rid;
 }
 
-// Merge incoming entries (from metadata, broadcast, or a local roll) into the
-// rendered log, dedup by id, notify about other players' new rolls.
+function notify(entry) {
+  if (!obrReady) return;
+  OBR.notification.show(`${entry.name} rolled ${entry.formula}: ${entry.total}`, "INFO").catch(() => {});
+}
+
+// ---------- log merge / render ----------
+
+function capAndSort(list) {
+  list.sort((a, b) => a.time - b.time);
+  return list.length > MAX_HISTORY ? list.slice(-MAX_HISTORY) : list;
+}
+
+// Authoritative replace from the server (handles clears and late joins).
+function setLogFromServer(entries) {
+  currentLog = capAndSort([...entries]);
+  if (currentLog.length) lastSeenTime = Math.max(lastSeenTime, ...currentLog.map((e) => e.time));
+  appendAudit(currentLog);
+  renderLog();
+}
+
+// Additive merge for instant local/broadcast updates between reconciles.
 function mergeEntries(entries, notifyRemote = false) {
   const known = new Set(currentLog.map(entryKey));
   let added = false;
@@ -115,52 +187,26 @@ function mergeEntries(entries, notifyRemote = false) {
     known.add(entryKey(entry));
     currentLog.push(entry);
     added = true;
-    if (notifyRemote && entry.time > lastSeenTime && entry.name !== playerName) {
-      notify(entry);
-    }
+    if (notifyRemote && entry.time > lastSeenTime && entry.name !== playerName) notify(entry);
   }
   if (!added) return;
-  currentLog.sort((a, b) => a.time - b.time);
-  if (currentLog.length > MAX_HISTORY) currentLog = currentLog.slice(-MAX_HISTORY);
+  currentLog = capAndSort(currentLog);
   lastSeenTime = Math.max(lastSeenTime, ...currentLog.map((e) => e.time));
   appendAudit(currentLog);
   renderLog();
 }
 
-async function persistLog() {
-  if (!obrReady) return;
-  // Cap by entry count and serialized size to stay under the metadata limit.
-  let log = currentLog.slice(-MAX_HISTORY);
-  while (log.length > 1 && JSON.stringify(log).length > MAX_LOG_BYTES) log.shift();
-  try {
-    await OBR.room.setMetadata({ [LOG_KEY]: log });
-  } catch (err) {
-    setStatus(`couldn't save shared log: ${err.message || err}`, true);
-  }
-}
-
 async function clearMyRolls() {
   currentLog = currentLog.filter((e) => e.name !== playerName);
   renderLog();
-  if (obrReady) {
-    try {
-      const metadata = await OBR.room.getMetadata();
-      const log = getLog(metadata).filter((e) => e.name !== playerName);
-      await OBR.room.setMetadata({ [LOG_KEY]: log });
-    } catch (err) {
-      setStatus(`couldn't clear shared log: ${err.message || err}`, true);
-    }
+  try {
+    setLogFromServer(await serverClear(playerName));
+  } catch (err) {
+    setStatus(`couldn't clear on server (${err.message})`, true);
   }
 }
 
-function notify(entry) {
-  if (!obrReady) return;
-  OBR.notification
-    .show(`${entry.name} rolled ${entry.formula}: ${entry.total}`, "INFO")
-    .catch(() => {});
-}
-
-// ---------- 24h audit log (localStorage, per client) ----------
+// ---------- 24h audit log (localStorage, per client backup) ----------
 
 function loadAudit() {
   try {
@@ -177,18 +223,17 @@ function appendAudit(entries) {
   try {
     const audit = loadAudit();
     const known = new Set(audit.map(entryKey));
-    for (const entry of entries) {
-      if (!known.has(entryKey(entry))) audit.push(entry);
-    }
+    for (const entry of entries) if (!known.has(entryKey(entry))) audit.push(entry);
     audit.sort((a, b) => a.time - b.time);
     localStorage.setItem(AUDIT_KEY, JSON.stringify(audit));
   } catch (err) {
-    console.warn("audit log write failed:", err);
+    console.warn("audit write failed:", err);
   }
 }
 
 function describeEntry(entry) {
-  const adv = entry.advantage > 0 ? ` (Advantage ${entry.advantage})`
+  const adv =
+    entry.advantage > 0 ? ` (Advantage ${entry.advantage})`
     : entry.advantage < 0 ? ` (Disadvantage ${-entry.advantage})` : "";
   const explode = entry.exploding ? "" : " (no explosions)";
   const dice = entry.dice
@@ -197,12 +242,26 @@ function describeEntry(entry) {
   return `${entry.name} rolled ${entry.formula}${adv}${explode}: ${dice} => ${entry.total}`;
 }
 
-function exportAudit() {
-  const audit = loadAudit();
-  const lines = audit.map((e) => `${new Date(e.time).toLocaleString()}  ${describeEntry(e)}`);
-  const text = `Open Legend Dice — roll log (last 24h, exported ${new Date().toLocaleString()})\n\n`
-    + (lines.length ? lines.join("\n") : "No rolls recorded in the last 24 hours.")
-    + "\n\n--- raw data ---\n" + JSON.stringify(audit, null, 2) + "\n";
+async function exportLog() {
+  // Prefer the authoritative server log; fall back to the local audit.
+  let entries = loadAudit();
+  let source = "local audit (last 24h)";
+  try {
+    const server = await serverGetLog();
+    if (server.length) {
+      entries = server;
+      source = "shared server log (last 24h)";
+    }
+  } catch {
+    /* keep local */
+  }
+  const lines = entries.map((e) => `${new Date(e.time).toLocaleString()}  ${describeEntry(e)}`);
+  const text =
+    `Open Legend Dice — roll log (${source}, exported ${new Date().toLocaleString()})\n\n` +
+    (lines.length ? lines.join("\n") : "No rolls recorded in the last 24 hours.") +
+    "\n\n--- raw data ---\n" +
+    JSON.stringify(entries, null, 2) +
+    "\n";
   const blob = new Blob([text], { type: "text/plain" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
@@ -230,11 +289,12 @@ function sortedPoolSizes() {
 }
 
 function formulaString() {
-  const parts = sortedPoolSizes().map((size) => {
-    const n = pool.get(size);
-    return (n > 1 ? n : "") + "d" + size;
-  });
-  return parts.join(" + ");
+  return sortedPoolSizes()
+    .map((size) => {
+      const n = pool.get(size);
+      return (n > 1 ? n : "") + "d" + size;
+    })
+    .join(" + ");
 }
 
 async function doRoll() {
@@ -242,15 +302,13 @@ async function doRoll() {
   const exploding = explodeToggle.checked;
   const dice = [];
   for (const size of sortedPoolSizes()) {
-    for (let i = 0; i < pool.get(size); i++) {
-      dice.push(rollExploding(size, exploding));
-    }
+    for (let i = 0; i < pool.get(size); i++) dice.push(rollExploding(size, exploding));
   }
 
   if (advantage !== 0) {
     // Extra dice match the attribute die: the largest non-d20 die in the pool.
-    // With a bare d20 pool, adv/dis applies to the d20 itself — and per Open
-    // Legend you never roll more than one extra d20, whatever the level.
+    // With a bare d20 pool, adv/dis applies to the d20 — and per Open Legend you
+    // never roll more than one extra d20, whatever the advantage level.
     const sizes = [...new Set(dice.map((d) => d.size))];
     const nonD20 = sizes.filter((s) => s !== 20);
     const target = nonD20.length ? Math.max(...nonD20) : Math.max(...sizes);
@@ -281,9 +339,11 @@ async function doRoll() {
   lastSeenTime = entry.time;
   notify(entry);
   mergeEntries([entry]); // show locally right away
-  if (obrReady) {
-    OBR.broadcast.sendMessage(CHANNEL, entry).catch(() => {});
-    await persistLog();
+  if (obrReady) OBR.broadcast.sendMessage(CHANNEL, entry).catch(() => {}); // instant to peers
+  try {
+    setLogFromServer(await serverPostRoll(entry)); // durable + canonical
+  } catch (err) {
+    setStatus(`roll not saved to server (${err.message}) — visible locally only`, true);
   }
 }
 
@@ -355,9 +415,8 @@ function buildEntryElement(entry) {
       const classes = ["die"];
       if (d.rolls.length > 1) classes.push("exploded");
       if (d.dropped) classes.push("dropped");
-      const rollsText = d.rolls.length > 1
-        ? `${d.rolls.join("+")} = <span class="sum">${d.total}</span>`
-        : `${d.total}`;
+      const rollsText =
+        d.rolls.length > 1 ? `${d.rolls.join("+")} = <span class="sum">${d.total}</span>` : `${d.total}`;
       const extraMark = d.extra ? '<span class="extra-mark">adv</span>' : "";
       return `<span class="${classes.join(" ")}"><span class="dtype">d${d.size}</span>${rollsText}${extraMark}</span>`;
     })
@@ -376,18 +435,17 @@ function buildEntryElement(entry) {
 
 function renderLog() {
   historyEl.innerHTML = "";
-  for (let i = currentLog.length - 1; i >= 0; i--) {
-    historyEl.appendChild(buildEntryElement(currentLog[i]));
-  }
+  for (let i = currentLog.length - 1; i >= 0; i--) historyEl.appendChild(buildEntryElement(currentLog[i]));
 }
 
 function buildControls() {
   for (let score = 0; score <= 10; score++) {
     const btn = document.createElement("button");
     btn.textContent = score;
-    btn.title = score === 0
-      ? "Attribute 0: 1d20 only"
-      : `Attribute ${score}: 1d20 + ${ATTRIBUTE_DICE[score].count}d${ATTRIBUTE_DICE[score].size}`;
+    btn.title =
+      score === 0
+        ? "Attribute 0: 1d20 only"
+        : `Attribute ${score}: 1d20 + ${ATTRIBUTE_DICE[score].count}d${ATTRIBUTE_DICE[score].size}`;
     btn.addEventListener("click", () => setPoolFromAttribute(score));
     attrGrid.appendChild(btn);
   }
@@ -401,11 +459,20 @@ function buildControls() {
     });
     diceRow.appendChild(btn);
   }
-  $("advPlus").addEventListener("click", () => { advantage = Math.min(advantage + 1, 9); renderAdvLabel(); });
-  $("advMinus").addEventListener("click", () => { advantage = Math.max(advantage - 1, -9); renderAdvLabel(); });
-  $("clearBtn").addEventListener("click", () => { pool.clear(); renderPool(); });
+  $("advPlus").addEventListener("click", () => {
+    advantage = Math.min(advantage + 1, 9);
+    renderAdvLabel();
+  });
+  $("advMinus").addEventListener("click", () => {
+    advantage = Math.max(advantage - 1, -9);
+    renderAdvLabel();
+  });
+  $("clearBtn").addEventListener("click", () => {
+    pool.clear();
+    renderPool();
+  });
   $("clearLogBtn").addEventListener("click", clearMyRolls);
-  $("exportBtn").addEventListener("click", exportAudit);
+  $("exportBtn").addEventListener("click", exportLog);
   rollBtn.addEventListener("click", doRoll);
 }
 
