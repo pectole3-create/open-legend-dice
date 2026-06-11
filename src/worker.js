@@ -25,7 +25,7 @@ function manifest(origin) {
     manifest_version: 1,
     author: "VladiSlave",
     description:
-      "Dice roller for Open Legend RPG: mixed dice pools, exploding dice, advantage and disadvantage, with a shared server-side roll log.",
+      "Open Legend dice roller with exploding dice, advantage/disadvantage, and a shared roll log.",
     icon: `${origin}/icon.svg`,
     action: {
       title: "Open Legend Dice",
