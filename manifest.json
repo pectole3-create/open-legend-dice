@@ -1,0 +1,15 @@
+{
+  "name": "Open Legend Dice",
+  "version": "1.4.0",
+  "manifest_version": 1,
+  "author": "VladiSlave",
+  "description": "Open Legend dice roller with exploding dice, advantage/disadvantage, and a shared roll log.",
+  "icon": "https://pectole3-create.github.io/open-legend-dice/icon.svg",
+  "action": {
+    "title": "Open Legend Dice",
+    "icon": "https://pectole3-create.github.io/open-legend-dice/icon.svg",
+    "popover": "https://pectole3-create.github.io/open-legend-dice/index.html",
+    "height": 620,
+    "width": 340
+  }
+}
