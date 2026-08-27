@@ -1,6 +1,6 @@
 {
   "name": "open-legend-dice",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "private": true,
   "description": "Owlbear Rodeo dice roller for Open Legend RPG with a shared room-metadata log.",
   "scripts": {

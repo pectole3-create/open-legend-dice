@@ -47,7 +47,7 @@ import OBR from "./owlbear-sdk.js";
   }
 })();
 
-const VERSION = "1.5.0";
+const VERSION = "1.5.1";
 const NS = "com.vladi.open-legend-dice";
 const LOG_PREFIX = `${NS}/log/`; // + playerId — each player owns exactly one key
 const CHANNEL = `${NS}/roll`;
@@ -94,7 +94,28 @@ const explodeToggle = $("explodeToggle");
 const rollBtn = $("rollBtn");
 const historyEl = $("history");
 const statusEl = $("status");
-const retryBtn = $("retryBtn");
+
+// A player can hold a cached copy of an older index.html while the browser fetches this
+// file fresh, so never assume newer markup exists — build what is missing instead of
+// throwing and taking the whole panel down with it.
+const retryBtn = $("retryBtn") || createRetryBtn();
+
+function createRetryBtn() {
+  const btn = document.createElement("button");
+  btn.id = "retryBtn";
+  btn.textContent = "Reconnect";
+  btn.hidden = true;
+  // Injected as a rule, not inline style: an inline `display:block` would beat the
+  // [hidden] attribute and leave the button permanently on screen.
+  const css = document.createElement("style");
+  css.textContent =
+    "#retryBtn{display:block;margin:4px auto 0;background:#343a52;border:1px solid #444a66;" +
+    "border-radius:5px;color:#e9e9f2;font-size:11px;padding:3px 10px;cursor:pointer}" +
+    "#retryBtn[hidden]{display:none}";
+  document.head.appendChild(css);
+  (statusEl.parentNode || document.body).appendChild(btn);
+  return btn;
+}
 
 function setStatus(text, isError = false, showRetry = false) {
   statusEl.textContent = `v${VERSION} · ${text}`;
