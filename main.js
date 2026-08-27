@@ -6,20 +6,61 @@
 //  - With no attribute dice (bare d20), adv/dis adds at most ONE extra d20 — you never
 //    roll more than 2d20, no matter how many advantages/disadvantages stack.
 //
-// Shared log: stored in Owlbear ROOM METADATA, which Owlbear persists and syncs to every
-// player — so everyone sees the same log, including people who join late or reload the
-// page. The log keeps the last 50 rolls. (Ephemeral broadcasts, used in early versions,
-// were the reason logs used to vanish on reload; metadata fixes that.)
+// Randomness: crypto.getRandomValues with rejection sampling (see randomInt), not
+// Math.random. Same fairness in practice, but it is a real CSPRNG seeded by the OS, so
+// nobody at the table can argue the luck is an artifact of a weak generator.
+//
+// Sync (v1.5.0 — rewritten; see README "How sharing works"):
+//  1. The SDK is imported STATICALLY, at the top of this module. It must be, because the
+//     SDK's only way of connecting is a passive window "message" listener installed when
+//     it evaluates — Owlbear posts OBR_READY exactly once, on iframe load. v1.4.0 loaded
+//     the SDK with a lazy dynamic import(), so on any client where that extra 56KB fetch
+//     finished after OBR_READY had already been posted, the message was missed and the
+//     panel sat on "connecting…" forever. A static import evaluates before the load
+//     event, which closes the race; index.html also buffers early messages and replays
+//     them below as a second line of defence.
+//  2. Each player writes ONLY their own room-metadata key (…/log/<playerId>) and the view
+//     is the merge of everyone's keys. v1.4.0 had every client read-modify-write ONE
+//     shared array, so two players rolling at the same moment meant one roll was silently
+//     overwritten.
+//  3. Broadcast delivers rolls instantly; metadata makes them survive reloads and late
+//     joins; a 20s reconcile re-reads metadata in case an event was missed.
 
-const VERSION = "1.4.0";
-const LOG_KEY = "com.vladi.open-legend-dice/log";
+import OBR from "./owlbear-sdk.js";
+
+// Replay any window messages that landed before the SDK's listener existed. The buffer is
+// installed by an inline script in the <head> of index.html, so it is listening from the
+// first moment the document can receive anything at all.
+(function replayEarlyMessages() {
+  const buffered = window.__obrEarlyMessages;
+  const handler = window.__obrEarlyHandler;
+  if (!buffered || !handler) return;
+  window.removeEventListener("message", handler);
+  delete window.__obrEarlyMessages;
+  delete window.__obrEarlyHandler;
+  for (const e of buffered) {
+    try {
+      window.dispatchEvent(new MessageEvent("message", { data: e.data, origin: e.origin }));
+    } catch (err) {
+      console.warn("message replay failed:", err);
+    }
+  }
+})();
+
+const VERSION = "1.5.0";
+const NS = "com.vladi.open-legend-dice";
+const LOG_PREFIX = `${NS}/log/`; // + playerId — each player owns exactly one key
+const CHANNEL = `${NS}/roll`;
 const AUDIT_KEY = "open-legend-dice-audit";
 const AUDIT_TTL_MS = 24 * 60 * 60 * 1000;
 const DIE_SIZES = [4, 6, 8, 10, 12, 20];
 const MAX_DICE_PER_TYPE = 20;
 const MAX_EXPLOSIONS = 50;
-const MAX_HISTORY = 50;
-const MAX_META_BYTES = 14000; // room metadata is capped ~16KB; stay safely under
+const MAX_HISTORY = 50; // rolls shown in the merged log
+const MY_MAX = 15; // rolls kept in my own metadata slot
+const MY_MAX_BYTES = 2200; // room metadata is ~16KB TOTAL and shared with other extensions
+const RECONCILE_MS = 20000;
+const READY_TIMEOUT_MS = 12000;
 
 // Attribute score -> attribute dice (always paired with 1d20), per Open Legend.
 const ATTRIBUTE_DICE = {
@@ -39,9 +80,10 @@ const ATTRIBUTE_DICE = {
 const pool = new Map(); // die size -> count
 let advantage = 0; // positive = advantage, negative = disadvantage
 let playerName = "You";
-let OBR = null;
 let obrReady = false;
-let localLog = []; // fallback when opened outside Owlbear (standalone testing)
+let myKey = null;
+let myLog = []; // my own slot; only this client ever writes it
+const entries = new Map(); // id -> entry, the merged view of everyone's slots
 
 const $ = (id) => document.getElementById(id);
 const attrGrid = $("attrGrid");
@@ -52,69 +94,183 @@ const explodeToggle = $("explodeToggle");
 const rollBtn = $("rollBtn");
 const historyEl = $("history");
 const statusEl = $("status");
+const retryBtn = $("retryBtn");
 
-function setStatus(text, isError = false) {
+function setStatus(text, isError = false, showRetry = false) {
   statusEl.textContent = `v${VERSION} · ${text}`;
   statusEl.classList.toggle("error", isError);
+  retryBtn.hidden = !showRetry;
+}
+
+// ---------- randomness ----------
+
+// Uniform integer in [0, max) from the OS CSPRNG. The rejection loop discards values in
+// the final partial block of 2^32 so no residue class is favoured — a plain `% max`
+// would very slightly over-weight the low faces.
+const cryptoOk = typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function";
+const randBuf = cryptoOk ? new Uint32Array(1) : null;
+
+function randomInt(max) {
+  if (!cryptoOk) return Math.floor(Math.random() * max); // ancient-browser fallback
+  const limit = Math.floor(0x100000000 / max) * max;
+  let x;
+  do {
+    crypto.getRandomValues(randBuf);
+    x = randBuf[0];
+  } while (x >= limit);
+  return x % max;
+}
+
+function rollDie(size) {
+  return randomInt(size) + 1;
 }
 
 // ---------- Owlbear Rodeo SDK ----------
 
-async function initOBR() {
+function initOBR() {
   setStatus("connecting…");
-  try {
-    // SDK is bundled and served from the same origin (owlbear-sdk.js) so it loads for
-    // everyone — no third-party CDN that an ad-blocker/proxy might block. Timeout guards
-    // against a stuck load.
-    const mod = await Promise.race([
-      import("./owlbear-sdk.js"),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("SDK load timed out")), 8000)),
-    ]);
-    const sdk = mod.default;
-    OBR = sdk;
-    if (!sdk.isAvailable) {
-      setStatus("open inside an Owlbear Rodeo room to share rolls (local-only here)");
-      renderLog(localLog);
-      return;
+
+  if (!OBR.isAvailable) {
+    // No ?obrref= in the URL: we are not inside an Owlbear iframe at all.
+    setStatus("open inside an Owlbear Rodeo room to share rolls (local-only here)");
+    renderMerged();
+    return;
+  }
+
+  // Watchdog: never leave the user staring at "connecting…" with no explanation.
+  setTimeout(() => {
+    if (!obrReady) {
+      setStatus("Owlbear never finished the handshake — rolls are local-only", true, true);
     }
-    OBR.onReady(async () => {
-      try {
-        obrReady = true;
-        playerName = (await OBR.player.getName()) || "Player";
-        const md = await OBR.room.getMetadata();
-        renderLog(getLog(md));
-        OBR.room.onMetadataChange((m) => renderLog(getLog(m)));
-        setStatus(`connected as ${playerName} — shared log live`);
-      } catch (err) {
-        setStatus(`Owlbear error: ${err.message || err}`, true);
-      }
-    });
+  }, READY_TIMEOUT_MS);
+
+  OBR.onReady(async () => {
+    try {
+      obrReady = true;
+      const [name, id] = await Promise.all([OBR.player.getName(), OBR.player.getId()]);
+      playerName = name || "Player";
+      myKey = LOG_PREFIX + id;
+
+      const md = await OBR.room.getMetadata();
+      absorbMetadata(md);
+      myLog = (Array.isArray(md[myKey]) ? md[myKey] : []).map(unpackEntry).filter(Boolean);
+      renderMerged();
+
+      OBR.room.onMetadataChange((m) => {
+        absorbMetadata(m);
+        renderMerged();
+      });
+
+      OBR.broadcast.onMessage(CHANNEL, (event) => {
+        const entry = unpackEntry(event.data);
+        if (!entry) return;
+        entries.set(entry.id, entry);
+        appendAudit(entry);
+        renderMerged();
+      });
+
+      // Belt-and-braces: a missed metadata event self-heals within 20 seconds.
+      setInterval(reconcile, RECONCILE_MS);
+      pruneStaleSlots(md).catch(() => {});
+
+      setStatus(`connected as ${playerName} — shared log live`);
+    } catch (err) {
+      console.error(err);
+      setStatus(`Owlbear error: ${err.message || err}`, true, true);
+    }
+  });
+}
+
+async function reconcile() {
+  if (!obrReady) return;
+  try {
+    absorbMetadata(await OBR.room.getMetadata());
+    renderMerged();
   } catch (err) {
-    console.warn("Owlbear SDK unavailable:", err);
-    setStatus("standalone (SDK failed to load) — local-only", true);
-    renderLog(localLog);
+    console.warn("reconcile failed:", err);
   }
 }
 
-function getLog(metadata) {
-  const log = metadata[LOG_KEY];
-  return Array.isArray(log) ? log : [];
+// Pull every player's slot out of room metadata into the merged view.
+function absorbMetadata(metadata) {
+  for (const [key, value] of Object.entries(metadata || {})) {
+    if (!key.startsWith(LOG_PREFIX) || !Array.isArray(value)) continue;
+    for (const raw of value) {
+      const entry = unpackEntry(raw);
+      if (entry) entries.set(entry.id, entry);
+    }
+  }
 }
 
-// Append a roll to the shared metadata log, keeping the last 50 and staying under
-// the metadata size cap. The resulting onMetadataChange re-renders for everyone.
-async function appendToSharedLog(entry) {
-  const md = await OBR.room.getMetadata();
-  let log = getLog(md);
-  log.push(entry);
-  if (log.length > MAX_HISTORY) log = log.slice(-MAX_HISTORY);
-  while (log.length > 1 && JSON.stringify({ [LOG_KEY]: log }).length > MAX_META_BYTES) log.shift();
-  await OBR.room.setMetadata({ [LOG_KEY]: log });
+// Drop slots belonging to players whose rolls are all older than a day, so the room's
+// shared ~16KB metadata budget does not fill with people who left weeks ago.
+async function pruneStaleSlots(metadata) {
+  const cutoff = Date.now() - AUDIT_TTL_MS;
+  const dead = {};
+  for (const [key, value] of Object.entries(metadata || {})) {
+    if (!key.startsWith(LOG_PREFIX) || key === myKey || !Array.isArray(value)) continue;
+    const times = value.map((r) => (r && (r.m || r.time)) || 0);
+    if (times.length && Math.max(...times) < cutoff) dead[key] = undefined;
+  }
+  if (Object.keys(dead).length) await OBR.room.setMetadata(dead);
+}
+
+// Write my own slot. No other client writes this key, so there is no lost-update race.
+async function publishMyLog() {
+  myLog = myLog.slice(-MY_MAX);
+  let packed = myLog.map(packEntry);
+  while (packed.length > 1 && JSON.stringify(packed).length > MY_MAX_BYTES) {
+    myLog = myLog.slice(1);
+    packed = myLog.map(packEntry);
+  }
+  await OBR.room.setMetadata({ [myKey]: packed });
 }
 
 function notify(entry) {
   if (!obrReady) return;
   OBR.notification.show(`${entry.name} rolled ${entry.formula}: ${entry.total}`, "INFO").catch(() => {});
+}
+
+// ---------- entry packing (room metadata is a tight budget) ----------
+
+function packEntry(e) {
+  return {
+    i: e.id,
+    n: e.name,
+    f: e.formula,
+    a: e.advantage,
+    x: e.exploding ? 1 : 0,
+    t: e.total,
+    m: e.time,
+    d: e.dice.map((d) => {
+      const o = { s: d.size, r: d.rolls };
+      if (d.dropped) o.p = 1;
+      if (d.extra) o.e = 1;
+      return o;
+    }),
+  };
+}
+
+function unpackEntry(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  if (raw.id && Array.isArray(raw.dice)) return raw; // v1.4.0 format, still readable
+  if (!raw.i || !Array.isArray(raw.d)) return null;
+  return {
+    id: raw.i,
+    name: raw.n,
+    formula: raw.f,
+    advantage: raw.a || 0,
+    exploding: !!raw.x,
+    total: raw.t,
+    time: raw.m,
+    dice: raw.d.map((d) => ({
+      size: d.s,
+      rolls: d.r,
+      total: d.r.reduce((a, b) => a + b, 0),
+      dropped: !!d.p,
+      extra: !!d.e,
+    })),
+  };
 }
 
 // ---------- 24h audit log (localStorage, per-client backup) ----------
@@ -133,7 +289,8 @@ function loadAudit() {
 function appendAudit(entry) {
   try {
     const audit = loadAudit();
-    if (!audit.some((e) => e.id === entry.id)) audit.push(entry);
+    if (audit.some((e) => e.id === entry.id)) return;
+    audit.push(entry);
     audit.sort((a, b) => a.time - b.time);
     localStorage.setItem(AUDIT_KEY, JSON.stringify(audit));
   } catch (err) {
@@ -156,7 +313,7 @@ function exportLog() {
   const audit = loadAudit();
   const lines = audit.map((e) => `${new Date(e.time).toLocaleString()}  ${describeEntry(e)}`);
   const text =
-    `Open Legend Dice — your roll log (last 24h, exported ${new Date().toLocaleString()})\n\n` +
+    `Open Legend Dice — roll log (last 24h, exported ${new Date().toLocaleString()})\n\n` +
     (lines.length ? lines.join("\n") : "No rolls recorded in the last 24 hours.") +
     "\n\n--- raw data ---\n" +
     JSON.stringify(audit, null, 2) +
@@ -170,10 +327,6 @@ function exportLog() {
 }
 
 // ---------- dice logic ----------
-
-function rollDie(size) {
-  return Math.floor(Math.random() * size) + 1;
-}
 
 function rollExploding(size, exploding) {
   const rolls = [rollDie(size)];
@@ -225,7 +378,7 @@ async function doRoll() {
 
   const total = dice.filter((d) => !d.dropped).reduce((a, d) => a + d.total, 0);
   const entry = {
-    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    id: `${Date.now()}-${randomInt(0xffffff).toString(36)}`,
     name: playerName,
     formula: formulaString(),
     advantage,
@@ -235,18 +388,21 @@ async function doRoll() {
     time: Date.now(),
   };
 
+  // Show it locally first — the log never waits on the network.
+  entries.set(entry.id, entry);
   appendAudit(entry);
-  if (obrReady) {
-    notify(entry);
-    try {
-      await appendToSharedLog(entry); // metadata change re-renders for everyone, incl. us
-    } catch (err) {
-      setStatus(`roll not saved to shared log (${err.message})`, true);
-    }
-  } else {
-    localLog.push(entry);
-    if (localLog.length > MAX_HISTORY) localLog = localLog.slice(-MAX_HISTORY);
-    renderLog(localLog);
+  renderMerged();
+
+  if (!obrReady) return;
+  notify(entry);
+  OBR.broadcast.sendMessage(CHANNEL, packEntry(entry), { destination: "REMOTE" }).catch((err) => {
+    console.warn("broadcast failed:", err);
+  });
+  myLog.push(entry);
+  try {
+    await publishMyLog();
+  } catch (err) {
+    setStatus(`roll not saved to shared log (${err.message || err})`, true, true);
   }
 }
 
@@ -281,8 +437,28 @@ function renderPool() {
       poolEl.appendChild(chip);
     }
   }
+  renderRollBtn();
+}
+
+// Advantage/disadvantage is sticky — it stays set until you change it. That is useful for
+// a run of rolls and a trap for everything after, so the state is spelled out on the
+// button you are about to press, not just in the small label above it.
+function renderRollBtn() {
   rollBtn.disabled = pool.size === 0;
-  rollBtn.textContent = pool.size === 0 ? "Roll" : `Roll ${formulaString()}`;
+  rollBtn.classList.remove("adv", "dis");
+  if (pool.size === 0) {
+    rollBtn.textContent = "Roll";
+    return;
+  }
+  let suffix = "";
+  if (advantage > 0) {
+    suffix = ` · Advantage ${advantage}`;
+    rollBtn.classList.add("adv");
+  } else if (advantage < 0) {
+    suffix = ` · Disadvantage ${-advantage}`;
+    rollBtn.classList.add("dis");
+  }
+  rollBtn.textContent = `Roll ${formulaString()}${suffix}`;
 }
 
 function renderAdvLabel() {
@@ -296,6 +472,7 @@ function renderAdvLabel() {
   } else {
     advLabel.textContent = "Normal";
   }
+  renderRollBtn();
 }
 
 function escapeHtml(s) {
@@ -336,11 +513,19 @@ function buildEntryElement(entry) {
   return div;
 }
 
-function renderLog(log) {
+// Newest first, capped at MAX_HISTORY. Dedupe by id happens in the Map, so a roll that
+// arrives by broadcast and again by metadata is only ever shown once.
+function renderMerged() {
+  // Tie-break on id so two rolls in the same millisecond land in the same order on every
+  // client — otherwise the log looks subtly different from seat to seat.
+  const list = [...entries.values()].sort((a, b) => a.time - b.time || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const shown = list.slice(-MAX_HISTORY);
+  for (const e of list.slice(0, -MAX_HISTORY)) entries.delete(e.id);
+
   historyEl.innerHTML = "";
-  for (let i = log.length - 1; i >= 0; i--) {
-    appendAudit(log[i]); // mirror observed rolls into the local 24h backup
-    historyEl.appendChild(buildEntryElement(log[i]));
+  for (let i = shown.length - 1; i >= 0; i--) {
+    appendAudit(shown[i]); // mirror observed rolls into the local 24h backup
+    historyEl.appendChild(buildEntryElement(shown[i]));
   }
 }
 
@@ -373,11 +558,16 @@ function buildControls() {
     advantage = Math.max(advantage - 1, -9);
     renderAdvLabel();
   });
+  advLabel.addEventListener("click", () => {
+    advantage = 0; // click the label to snap back to Normal
+    renderAdvLabel();
+  });
   $("clearBtn").addEventListener("click", () => {
     pool.clear();
     renderPool();
   });
   $("exportBtn").addEventListener("click", exportLog);
+  retryBtn.addEventListener("click", () => location.reload());
   rollBtn.addEventListener("click", doRoll);
 }
 

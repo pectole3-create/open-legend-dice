@@ -4,6 +4,17 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Open Legend Dice</title>
+  <script>
+    // Owlbear posts OBR_READY into this iframe exactly once, on the load event, and the
+    // SDK receives it with a passive window "message" listener. If anything delays the
+    // SDK's listener past that post, the handshake is lost and the panel hangs on
+    // "connecting…" — which is exactly what happened in v1.4.0. This inline script runs
+    // during parse, before any module, and buffers whatever arrives; main.js replays the
+    // buffer into the SDK the moment it is loaded.
+    window.__obrEarlyMessages = [];
+    window.__obrEarlyHandler = function (e) { window.__obrEarlyMessages.push(e); };
+    window.addEventListener("message", window.__obrEarlyHandler);
+  </script>
   <style>
     :root {
       --bg: #1e2231;
@@ -140,9 +151,10 @@
       line-height: 1;
     }
     .adv-ctrl button:hover { border-color: var(--accent); }
-    #advLabel { min-width: 86px; text-align: center; font-size: 12.5px; }
+    #advLabel { min-width: 86px; text-align: center; font-size: 12.5px; cursor: pointer; }
     #advLabel.adv { color: var(--green); }
     #advLabel.dis { color: var(--red); }
+    #advLabel:hover { text-decoration: underline dotted; }
     .roll-bar { display: flex; gap: 6px; }
     #rollBtn {
       flex: 1;
@@ -157,6 +169,11 @@
     }
     #rollBtn:hover { background: #8a58f5; }
     #rollBtn:disabled { background: var(--panel-2); color: var(--text-dim); cursor: default; }
+    /* Adv/dis is sticky, so the button you are about to press says which one is active. */
+    #rollBtn.adv { background: #2f8a5c; }
+    #rollBtn.adv:hover { background: #37a46d; }
+    #rollBtn.dis { background: #b04545; }
+    #rollBtn.dis:hover { background: #c85252; }
     #clearBtn {
       padding: 9px 12px;
       background: var(--panel);
@@ -226,6 +243,19 @@
       padding-top: 2px;
     }
     #status.error { color: var(--red); }
+    #retryBtn {
+      display: block;
+      margin: 4px auto 0;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      color: var(--text);
+      font-size: 11px;
+      padding: 3px 10px;
+      cursor: pointer;
+    }
+    #retryBtn:hover { border-color: var(--accent); }
+    #retryBtn[hidden] { display: none; }
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
   </style>
@@ -257,7 +287,7 @@
         <input type="checkbox" id="explodeToggle" checked />
         Exploding
       </label>
-      <div class="adv-ctrl" title="Advantage: roll extra attribute dice, drop the lowest. Disadvantage: drop the highest.">
+      <div class="adv-ctrl" title="Advantage: roll extra attribute dice, drop the lowest. Disadvantage: drop the highest. This setting is sticky — click the label to reset to Normal.">
         <button id="advMinus">&minus;</button>
         <span id="advLabel">Normal</span>
         <button id="advPlus">+</button>
@@ -275,8 +305,9 @@
     </div>
     <div id="history"></div>
     <div id="status"></div>
+    <button id="retryBtn" hidden>Reconnect</button>
   </div>
 
-  <script type="module" src="main.js?v=1.4.0"></script>
+  <script type="module" src="main.js?v=1.5.0"></script>
 </body>
 </html>

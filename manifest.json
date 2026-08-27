@@ -1,6 +1,6 @@
 {
   "name": "Open Legend Dice",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "manifest_version": 1,
   "author": "VladiSlave",
   "description": "Open Legend dice roller with exploding dice, advantage/disadvantage, and a shared roll log.",

@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Fake Owlbear harness</title>
+<style>
+  body { background:#111; color:#ddd; font:13px system-ui; margin:0; padding:8px; }
+  #frames { display:flex; gap:8px; }
+  iframe { width:340px; height:620px; border:1px solid #444; background:#1e2231; }
+  #log { height:180px; overflow:auto; font:11px monospace; background:#000; padding:6px; margin-top:8px; }
+</style>
+</head>
+<body>
+<div id="frames"></div>
+<div id="log"></div>
+<script>
+// Minimal stand-in for the Owlbear Rodeo host: enough of the postMessage protocol to
+// exercise the extension's handshake and shared-log paths with two players in one room.
+const ORIGIN = location.origin;
+const OBRREF = btoa(ORIGIN + " testroom");
+const PLAYERS = [
+  { name: "Alice", id: "player-alice" },
+  { name: "Bob",   id: "player-bob" },
+];
+// READY_DELAY simulates how long the host waits before posting OBR_READY. 0 = the host
+// posts it the instant the iframe loads, which is the case that broke v1.4.0.
+const READY_DELAY = Number(new URLSearchParams(location.search).get("delay") || 0);
+
+let roomMeta = {};
+const frames = [];
+const log = (m) => {
+  const d = document.getElementById("log");
+  d.innerHTML += m + "<br>";
+  d.scrollTop = d.scrollHeight;
+};
+
+for (const p of PLAYERS) {
+  const f = document.createElement("iframe");
+  f.src = `./index.html?obrref=${OBRREF}`;
+  f.addEventListener("load", () => {
+    setTimeout(() => {
+      f.contentWindow.postMessage(
+        { id: "OBR_READY", data: { ref: p.id, userId: p.id } },
+        ORIGIN
+      );
+      log(`host -> ${p.name}: OBR_READY (delay ${READY_DELAY}ms)`);
+    }, READY_DELAY);
+  });
+  document.getElementById("frames").appendChild(f);
+  frames.push({ frame: f, player: p });
+}
+
+const reply = (source, id, nonce, data) =>
+  source.postMessage({ id: `${id}_RESPONSE${nonce}`, data }, ORIGIN);
+
+const toAll = (id, data) =>
+  frames.forEach((f) => f.frame.contentWindow.postMessage({ id, data }, ORIGIN));
+
+window.addEventListener("message", (e) => {
+  const msg = e.data;
+  if (!msg || typeof msg.id !== "string" || msg.id.includes("_RESPONSE")) return;
+  const who = frames.find((f) => f.frame.contentWindow === e.source);
+  if (!who) return;
+  const p = who.player;
+  const { id, data, nonce } = msg;
+
+  switch (id) {
+    case "OBR_PLAYER_GET_NAME": return reply(e.source, id, nonce, { name: p.name });
+    case "OBR_PLAYER_GET_ID":   return reply(e.source, id, nonce, { id: p.id });
+    case "OBR_PLAYER_GET_ROLE": return reply(e.source, id, nonce, { role: "PLAYER" });
+    case "OBR_ROOM_GET_METADATA": return reply(e.source, id, nonce, { metadata: roomMeta });
+    case "OBR_ROOM_SET_METADATA": {
+      for (const [k, v] of Object.entries(data.update)) {
+        if (v === undefined) delete roomMeta[k];
+        else roomMeta[k] = v;
+      }
+      log(`${p.name} wrote metadata; keys now: ${Object.keys(roomMeta).join(", ") || "(none)"}`);
+      reply(e.source, id, nonce, {});
+      return toAll("OBR_ROOM_METADATA_EVENT_CHANGE", { metadata: roomMeta });
+    }
+    case "OBR_BROADCAST_SEND_MESSAGE": {
+      reply(e.source, id, nonce, {});
+      const dest = (data.options && data.options.destination) || "REMOTE";
+      log(`${p.name} broadcast on ${data.channel} (${dest})`);
+      frames.forEach((f) => {
+        if (dest === "REMOTE" && f.frame.contentWindow === e.source) return;
+        f.frame.contentWindow.postMessage(
+          { id: `OBR_BROADCAST_MESSAGE_${data.channel}`, data: { data: data.data, connectionId: p.id } },
+          ORIGIN
+        );
+      });
+      return;
+    }
+    case "OBR_NOTIFICATION_SHOW": return reply(e.source, id, nonce, { id: "n1" });
+    default:
+      if (nonce) reply(e.source, id, nonce, {});
+  }
+});
+
+// Test hooks driven from the automation side.
+window.harness = {
+  roomMeta: () => roomMeta,
+  // Roll on both players in the same tick — the concurrency case that lost rolls in v1.4.0.
+  rollBoth: () => frames.forEach((f) => f.frame.contentDocument.getElementById("rollBtn").click()),
+  pick: (i, attr) => frames[i].frame.contentDocument.querySelectorAll(".attr-grid button")[attr].click(),
+  entriesOf: (i) =>
+    [...frames[i].frame.contentDocument.querySelectorAll("#history .entry")].map((e) =>
+      e.innerText.replace(/\s+/g, " ")
+    ),
+  statusOf: (i) => frames[i].frame.contentDocument.getElementById("status").textContent,
+};
+</script>
+</body>
+</html>
