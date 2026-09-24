@@ -1,6 +1,9 @@
 // Open Legend Dice — dice roller extension for Owlbear Rodeo
 // Open Legend rules: https://openlegendrpg.com/core-rules/actions-attributes
 //  - Every die explodes: rolling the max value rolls that die again and adds (can chain).
+//  - Destructive Trance (feat): while in a battle trance, every die in the pool explodes on
+//    the maximum OR one below it — d4s on 3-4, d20s on 19-20 — and the total is still the
+//    number actually rolled, so a 19 adds 19 and then rolls again.
 //  - Advantage X: roll X extra attribute dice, keep the normal amount (drop the X lowest).
 //  - Disadvantage X: same, but drop the X highest.
 //  - With no attribute dice (bare d20), adv/dis adds at most ONE extra d20 — you never
@@ -47,7 +50,7 @@ import OBR from "./owlbear-sdk.js";
   }
 })();
 
-const VERSION = "1.5.1";
+const VERSION = "1.6.0";
 const NS = "com.vladi.open-legend-dice";
 const LOG_PREFIX = `${NS}/log/`; // + playerId — each player owns exactly one key
 const CHANNEL = `${NS}/roll`;
@@ -91,6 +94,9 @@ const diceRow = $("diceRow");
 const poolEl = $("pool");
 const advLabel = $("advLabel");
 const explodeToggle = $("explodeToggle");
+// Null when a player is still on a cached pre-1.6.0 index.html; every use is guarded, so
+// they simply do not get the feat until the HTML cache turns over.
+const tranceToggle = $("tranceToggle");
 const rollBtn = $("rollBtn");
 const historyEl = $("history");
 const statusEl = $("status");
@@ -255,7 +261,7 @@ function notify(entry) {
 // ---------- entry packing (room metadata is a tight budget) ----------
 
 function packEntry(e) {
-  return {
+  const packed = {
     i: e.id,
     n: e.name,
     f: e.formula,
@@ -270,6 +276,8 @@ function packEntry(e) {
       return o;
     }),
   };
+  if (e.trance) packed.z = 1; // omitted when off, to spend no metadata on the common case
+  return packed;
 }
 
 function unpackEntry(raw) {
@@ -282,6 +290,7 @@ function unpackEntry(raw) {
     formula: raw.f,
     advantage: raw.a || 0,
     exploding: !!raw.x,
+    trance: !!raw.z,
     total: raw.t,
     time: raw.m,
     dice: raw.d.map((d) => ({
@@ -324,10 +333,11 @@ function describeEntry(entry) {
     entry.advantage > 0 ? ` (Advantage ${entry.advantage})`
     : entry.advantage < 0 ? ` (Disadvantage ${-entry.advantage})` : "";
   const explode = entry.exploding ? "" : " (no explosions)";
+  const trance = entry.trance ? " (Destructive Trance)" : "";
   const dice = entry.dice
     .map((d) => `d${d.size}:${d.rolls.join("+")}${d.dropped ? " dropped" : ""}${d.extra ? " extra" : ""}`)
     .join(", ");
-  return `${entry.name} rolled ${entry.formula}${adv}${explode}: ${dice} => ${entry.total}`;
+  return `${entry.name} rolled ${entry.formula}${adv}${explode}${trance}: ${dice} => ${entry.total}`;
 }
 
 function exportLog() {
@@ -349,9 +359,13 @@ function exportLog() {
 
 // ---------- dice logic ----------
 
-function rollExploding(size, exploding) {
+// Destructive Trance drops the explosion threshold by one (d20s explode on 19 or 20). The
+// rule is explicit that the total is still the number rolled, so a 19 adds 19 — the die is
+// only re-rolled, never rounded up.
+function rollExploding(size, exploding, trance) {
+  const threshold = trance ? size - 1 : size;
   const rolls = [rollDie(size)];
-  while (exploding && rolls[rolls.length - 1] === size && rolls.length < MAX_EXPLOSIONS) {
+  while (exploding && rolls[rolls.length - 1] >= threshold && rolls.length < MAX_EXPLOSIONS) {
     rolls.push(rollDie(size));
   }
   return { size, rolls, total: rolls.reduce((a, b) => a + b, 0), dropped: false, extra: false };
@@ -373,9 +387,11 @@ function formulaString() {
 async function doRoll() {
   if (pool.size === 0) return;
   const exploding = explodeToggle.checked;
+  // The feat modifies how dice explode, so it can only do anything while explosions are on.
+  const trance = exploding && !!(tranceToggle && tranceToggle.checked);
   const dice = [];
   for (const size of sortedPoolSizes()) {
-    for (let i = 0; i < pool.get(size); i++) dice.push(rollExploding(size, exploding));
+    for (let i = 0; i < pool.get(size); i++) dice.push(rollExploding(size, exploding, trance));
   }
 
   if (advantage !== 0) {
@@ -388,7 +404,7 @@ async function doRoll() {
     let n = Math.abs(advantage);
     if (target === 20) n = Math.min(n, 1);
     for (let i = 0; i < n; i++) {
-      const extraDie = rollExploding(target, exploding);
+      const extraDie = rollExploding(target, exploding, trance);
       extraDie.extra = true;
       dice.push(extraDie);
     }
@@ -404,6 +420,7 @@ async function doRoll() {
     formula: formulaString(),
     advantage,
     exploding,
+    trance,
     dice: dice.map(({ size, rolls, total, dropped, extra }) => ({ size, rolls, total, dropped, extra })),
     total,
     time: Date.now(),
@@ -510,6 +527,7 @@ function buildEntryElement(entry) {
   if (entry.advantage > 0) advTag = ` <span class="adv">(Advantage ${entry.advantage})</span>`;
   else if (entry.advantage < 0) advTag = ` <span class="dis">(Disadvantage ${-entry.advantage})</span>`;
   const explodeTag = entry.exploding ? "" : " (no explosions)";
+  const tranceTag = entry.trance ? ' <span class="trance">(Destructive Trance)</span>' : "";
 
   const diceHtml = entry.dice
     .map((d) => {
@@ -529,7 +547,7 @@ function buildEntryElement(entry) {
       <span class="entry-name">${escapeHtml(entry.name)} <span style="color:var(--text-dim);font-weight:400;font-size:11px">${time}</span></span>
       <span class="entry-total">${entry.total}</span>
     </div>
-    <div class="entry-formula">${escapeHtml(entry.formula)}${advTag}${explodeTag}</div>
+    <div class="entry-formula">${escapeHtml(entry.formula)}${advTag}${explodeTag}${tranceTag}</div>
     <div class="die-results">${diceHtml}</div>`;
   return div;
 }
@@ -570,6 +588,16 @@ function buildControls() {
       addDie(size, -1);
     });
     diceRow.appendChild(btn);
+  }
+  if (tranceToggle) {
+    // The feat only changes the explosion threshold, so it is meaningless with explosions
+    // off. Grey it out there rather than letting someone tick a box that does nothing.
+    const syncTrance = () => {
+      tranceToggle.disabled = !explodeToggle.checked;
+      tranceToggle.parentElement.classList.toggle("disabled", tranceToggle.disabled);
+    };
+    explodeToggle.addEventListener("change", syncTrance);
+    syncTrance();
   }
   $("advPlus").addEventListener("click", () => {
     advantage = Math.min(advantage + 1, 9);

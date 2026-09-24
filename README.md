@@ -18,6 +18,11 @@ https://pectole3-create.github.io/open-legend-dice/manifest.json
 - **Attribute quick-select (0–10)** — sets the pool to `1d20 + attribute dice` per the Open Legend table.
 - **Exploding dice** — a die that rolls its maximum is rolled again and added (chains allowed).
   Toggleable, on by default.
+- **Destructive Trance** — checkbox for the feat: every die in the pool explodes on its maximum
+  *or one below it* (d4s on 3–4, d6s on 5–6, d20s on 19–20). Per the rule text the total is still
+  the number actually rolled, so a 19 on a d20 adds 19 and then rolls again — it is not rounded up
+  to 20. Greyed out when Exploding is off, since the feat only moves the explosion threshold.
+  Rolls made under it are tagged in the shared log and in the export.
 - **Advantage / Disadvantage 1–9** — rolls that many extra attribute dice and drops the lowest
   (advantage) or highest (disadvantage). A bare d20 pool adds at most **one** extra d20, never 3d20.
   The setting is sticky, so the Roll button turns green/red and names it; click the label to reset.
@@ -33,6 +38,11 @@ rigged" is a conversation worth ending permanently. The rejection loop discards 
 partial block of 2³², so no face is favoured by the modulo — see `randomInt` in `main.js`.
 
 Verified with a 120k-roll χ² test in the browser: χ² = 15.6 on 19 df, mean 10.51 vs 10.5 expected.
+
+Exploding means are checked against closed form. One roll averages `(N+1)/2` and re-rolls with
+probability `p` (`1/N` normally, `2/N` in a Destructive Trance), so the expected total is
+`(N+1)/2 · 1/(1-p)`. Simulated at 400k rolls per die size, every size matches to three decimals —
+d20 gives 11.060 vs 11.053 normally and 11.684 vs 11.667 in a trance.
 
 ## How sharing works
 
